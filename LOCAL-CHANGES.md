@@ -67,3 +67,34 @@ All 26 upstream tests pass with these changes (`npm test`).
 - If you point this at hosted TypeSafe instead, the upstream defaults remain
   reasonable; the tuning here targets a smaller local model with a noisier
   confidence distribution.
+
+## Model-tier routing
+
+Optional, off unless configured. Alongside `next_tool`, the plugin asks a second
+question in the **same** round-trip — `model_tier` — whose criteria are the tiers
+you define. When the chosen tier clears `minConfidence`, the outgoing request's
+`model` field is rewritten before it leaves the plugin. One decision, two
+actions: tool trim and model selection.
+
+```yaml
+# ~/.config/jev/config.yaml
+tiers:
+  flash:
+    model: deepseek-v4.1-flash
+    description: Single-step work — reads, greps, small edits, quick answers
+  pro:
+    model: deepseek-v4-pro
+    description: Multi-file refactors, architecture, hard debugging, ambiguous specs
+```
+
+`model` must be the exact id the provider puts in the request body (not
+`provider/id`), because the plugin rewrites that field verbatim. Tiers are
+independent of the tool decision: a strong tier can be selected on a step whose
+tool choice is still below threshold.
+
+Log lines distinguish the two actions:
+
+```
+apply: model deepseek-v4.1-flash -> deepseek-v4-pro (pro@0.81 >= minConfidence 0.6)
+apply: tools trimmed to edit only (edit@0.95 >= minConfidence 0.6)
+```

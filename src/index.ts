@@ -54,12 +54,20 @@ import { Plugin } from "@opencode/plugin";
  * "Reading the decision log" for the full line-by-line interpretation.
  */
 
+interface ModelTier {
+  name: string;
+  model: string;
+  description: string;
+}
+
 interface JevConfig {
   apiKey: string;
   apiUrl: string;
   minConfidence: number;
   timeoutMs: number;
   model: string;
+  /** Optional model tiers, chosen by Jev in the same round-trip as the tool. */
+  tiers: ModelTier[];
 }
 
 type RawConfig = Record<string, unknown>;
@@ -69,6 +77,7 @@ type Target = "anthropic" | "openai" | "responses";
 interface JevAnswer {
   choice: string;
   confidence: number;
+  tier?: { name: string; confidence: number };
 }
 
 const DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone";
@@ -228,6 +237,31 @@ function positiveIntFromEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function pickTiers(layers: RawConfig[]): ModelTier[] {
+  const out: ModelTier[] = [];
+  for (const layer of layers) {
+    const raw = layer.tiers;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+      const spec = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+      const model = typeof value === "string" ? value : typeof spec.model === "string" ? spec.model : undefined;
+      if (!model) continue;
+      if (out.some((tier) => tier.name === name)) continue;
+      const description =
+        typeof spec.description === "string" && spec.description.trim()
+          ? spec.description
+          : `Use the ${name} model`;
+      out.push({
+        name,
+        model,
+        description: description.replace(/\s+/g, " ").trim().slice(0, TOOL_DESC_CHARS),
+      });
+    }
+    if (out.length > 0) break;
+  }
+  return out;
+}
+
 async function loadConfig(
   options: RawConfig,
   baseDir: string,
@@ -246,6 +280,7 @@ async function loadConfig(
       positiveIntFromEnv("JEV_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
     model:
       pickString(layers, "model") ?? process.env.JEV_MODEL ?? DEFAULT_MODEL,
+    tiers: pickTiers(layers),
   };
 }
 
@@ -461,6 +496,7 @@ async function askJev(
   names: string[],
   descriptions: Record<string, string> = {},
 ): Promise<JevAnswer | undefined> {
+  const tierCriteria = Object.fromEntries(cfg.tiers.map((tier) => [tier.name, tier.description]));
   if (names.length > MAX_CRITERIA - 1)
     log(
       `note: ${names.length} tools exceed criteria cap ${MAX_CRITERIA - 1} — first ${MAX_CRITERIA - 1} offered to jev`,
@@ -486,6 +522,16 @@ async function askJev(
           instructions: "Which tool should the coding agent execute next?",
           criteria,
         },
+        ...(cfg.tiers.length > 0
+          ? {
+              model_tier: {
+                type: "choice",
+                instructions:
+                  "Which model tier should execute this step? Pick the cheapest tier that can handle it.",
+                criteria: tierCriteria,
+              },
+            }
+          : {}),
       },
     }),
     signal: AbortSignal.timeout(cfg.timeoutMs),
@@ -504,6 +550,7 @@ async function askJev(
   const payload = (await response.json()) as {
     answers?: {
       next_tool?: { type?: unknown; choice?: unknown; confidence?: unknown };
+      model_tier?: { type?: unknown; choice?: unknown; confidence?: unknown };
     };
   };
   const answer = payload.answers?.next_tool;
@@ -517,7 +564,17 @@ async function askJev(
     log("jev answer malformed");
     return undefined;
   }
-  return { choice: answer.choice, confidence: answer.confidence };
+  const tierAnswer = payload.answers?.model_tier;
+  const tier =
+    tierAnswer &&
+    tierAnswer.type === "choice" &&
+    typeof tierAnswer.choice === "string" &&
+    typeof tierAnswer.confidence === "number" &&
+    Number.isFinite(tierAnswer.confidence) &&
+    cfg.tiers.some((candidate) => candidate.name === tierAnswer.choice)
+      ? { name: tierAnswer.choice, confidence: tierAnswer.confidence }
+      : undefined;
+  return { choice: answer.choice, confidence: answer.confidence, tier };
 }
 
 /* --------------------------------------------------- interception core */
@@ -548,18 +605,34 @@ async function routePayload(
     log("bypass: jev unavailable (see preceding 'jev ...' error line) — full tool list sent untouched");
     return false;
   }
+
+  // Model tier is an independent question answered in the same round-trip:
+  // it stays useful even when the tool decision is below threshold.
+  let changed = false;
+  if (answer.tier && answer.tier.confidence >= cfg.minConfidence) {
+    const tier = cfg.tiers.find((candidate) => candidate.name === answer.tier?.name);
+    const current = typeof payload.model === "string" ? payload.model : undefined;
+    if (tier && current !== undefined && current !== tier.model) {
+      payload.model = tier.model;
+      changed = true;
+      log(
+        `apply: model ${current} -> ${tier.model} (${tier.name}@${answer.tier.confidence} >= minConfidence ${cfg.minConfidence})`,
+      );
+    }
+  }
+
   const at = `${answer.choice}@${answer.confidence}`;
   if (answer.choice === "respond_to_user") {
     log(`bypass: jev says answer directly (${at}) — nothing to trim to, full tool list sent untouched`);
-    return false;
+    return changed;
   }
   if (!names.includes(answer.choice)) {
     log(`bypass: jev choice ${at} is not among this request's tools — full tool list sent untouched`);
-    return false;
+    return changed;
   }
   if (answer.confidence < cfg.minConfidence) {
     log(`bypass: jev choice ${at} below minConfidence ${cfg.minConfidence} — full tool list sent untouched`);
-    return false;
+    return changed;
   }
   // Force by trimming the candidate set to the chosen tool instead of pinning
   // via tool_choice: providers reject forced tool_choice in thinking mode
@@ -581,9 +654,10 @@ async function routePayload(
   });
   if (tools.length === 0) {
     log(`bypass: jev choice ${at} listed but missing from payload — full tool list sent untouched`);
-    return false;
+    return changed;
   }
   payload.tools = tools;
+  changed = true;
   const keptBuiltIns = tools.filter(isBuiltIn).length;
   log(
     `apply: tools trimmed to ${answer.choice}${
@@ -592,7 +666,7 @@ async function routePayload(
         : " only"
     } (${at} >= minConfidence ${cfg.minConfidence})`,
   );
-  return true;
+  return changed;
 }
 
 function eligible(payload: Record<string, unknown>): boolean {
