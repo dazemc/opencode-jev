@@ -88,7 +88,11 @@ tiers:
 ```
 
 `model` must be the exact id the provider puts in the request body (not
-`provider/id`), because the plugin rewrites that field verbatim. Tiers are
+`provider/id`), because the plugin rewrites that field verbatim.
+
+Tier switching has its own gate: `tierMinConfidence` (default: same as
+`minConfidence`). Raising it keeps cheap steps cheap: a 0.65 hunch no longer
+promotes the request to the expensive model while tool trims still act at 0.6. Tiers are
 independent of the tool decision: a strong tier can be selected on a step whose
 tool choice is still below threshold.
 

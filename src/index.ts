@@ -66,6 +66,8 @@ interface JevConfig {
   minConfidence: number;
   timeoutMs: number;
   model: string;
+  /** Gate for model-tier switching; defaults to minConfidence. */
+  tierMinConfidence: number;
   /** Optional model tiers, chosen by Jev in the same round-trip as the tool. */
   tiers: ModelTier[];
 }
@@ -271,10 +273,12 @@ async function loadConfig(
   if (!apiKey) return undefined;
   const confidence =
     pickNumber(layers, "minConfidence") ?? DEFAULT_MIN_CONFIDENCE;
+  const tierConfidence = pickNumber(layers, "tierMinConfidence") ?? confidence;
   return {
     apiKey,
     apiUrl: pickString(layers, "apiUrl") ?? DEFAULT_API_URL,
     minConfidence: Math.min(Math.max(confidence, 0), 1),
+    tierMinConfidence: Math.min(Math.max(tierConfidence, 0), 1),
     timeoutMs:
       pickNumber(layers, "timeoutMs", (v) => v > 0) ??
       positiveIntFromEnv("JEV_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
@@ -609,14 +613,14 @@ async function routePayload(
   // Model tier is an independent question answered in the same round-trip:
   // it stays useful even when the tool decision is below threshold.
   let changed = false;
-  if (answer.tier && answer.tier.confidence >= cfg.minConfidence) {
+  if (answer.tier && answer.tier.confidence >= cfg.tierMinConfidence) {
     const tier = cfg.tiers.find((candidate) => candidate.name === answer.tier?.name);
     const current = typeof payload.model === "string" ? payload.model : undefined;
     if (tier && current !== undefined && current !== tier.model) {
       payload.model = tier.model;
       changed = true;
       log(
-        `apply: model ${current} -> ${tier.model} (${tier.name}@${answer.tier.confidence} >= minConfidence ${cfg.minConfidence})`,
+        `apply: model ${current} -> ${tier.model} (${tier.name}@${answer.tier.confidence} >= tierMinConfidence ${cfg.tierMinConfidence})`,
       );
     }
   }
