@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist/ is committed in this fork so git-based installs work without a build step
 *.tgz
 .DS_Store
 
