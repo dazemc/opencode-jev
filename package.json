@@ -44,15 +44,14 @@
   "dependencies": {
     "yaml": "^2.9.1"
   },
-  "peerDependencies": {
-    "@opencode/plugin": "^2.0.11"
-  },
-  "devDependencies": {
-    "@opencode/plugin": "^2.0.11",
-    "@types/bun": "^1.4.2",
-    "typescript": "^5.8.2"
-  },
   "publishConfig": {
     "access": "public"
+  },
+  "openclaw": {
+    "devDependenciesRemovedForGitInstall": [
+      "@opencode/plugin",
+      "@types/bun",
+      "typescript"
+    ]
   }
 }
