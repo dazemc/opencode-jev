@@ -75,9 +75,14 @@ const DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone";
 const DEFAULT_MIN_CONFIDENCE = 0.75;
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_MODEL = "jev-latest";
-const STATE_CHAR_BUDGET = 8000;
-const TURN_CHAR_BUDGET = 2000;
-const RECENT_TURNS = 4;
+// Snapshot budgets. Empirically, long state dilutes the decision: on the same
+// question, 9 ledger entries scored 0.535 confidence where 3 entries scored
+// 0.886. Short and recent beats long and complete.
+const STATE_CHAR_BUDGET = 6000;
+const TURN_CHAR_BUDGET = 1200;
+const RECENT_TURNS = 3;
+const TOOL_RESULT_CHARS = 300;
+const TOOL_DESC_CHARS = 160;
 // TypeSafe choice questions accept at most 255 criteria; one slot is reserved
 // for respond_to_user.
 const MAX_CRITERIA = 255;
@@ -299,6 +304,34 @@ function toolNames(tools: unknown[]): string[] {
   return names;
 }
 
+function toolDescriptions(tools: unknown[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const tool of tools) {
+    if (typeof tool !== "object" || tool === null || isBuiltIn(tool)) continue;
+    const record = tool as {
+      name?: unknown;
+      description?: unknown;
+      function?: { name?: unknown; description?: unknown };
+    };
+    const name =
+      typeof record.name === "string"
+        ? record.name
+        : typeof record.function?.name === "string"
+          ? record.function.name
+          : undefined;
+    if (!name) continue;
+    const raw =
+      typeof record.description === "string"
+        ? record.description
+        : typeof record.function?.description === "string"
+          ? record.function.description
+          : "";
+    const desc = raw.replace(/\s+/g, " ").trim();
+    if (desc) out[name] = desc.slice(0, TOOL_DESC_CHARS);
+  }
+  return out;
+}
+
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map(textOf).join(" ");
@@ -310,6 +343,100 @@ function textOf(content: unknown): string {
   return "";
 }
 
+type LedgerEntry = { role: string; text: string };
+
+function partKind(part: unknown): string {
+  if (typeof part !== "object" || part === null) return "";
+  const type = (part as { type?: unknown }).type;
+  return typeof type === "string" ? type : "";
+}
+
+function summarizeValue(value: unknown, limit: number): string {
+  if (value === undefined || value === null) return "";
+  let out: string;
+  if (typeof value === "string") {
+    out = value;
+  } else {
+    try {
+      out = JSON.stringify(value) ?? String(value);
+    } catch {
+      out = String(value);
+    }
+  }
+  return out.replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function toolNameOfPart(part: Record<string, unknown>): string {
+  const name = part.toolName ?? part.name ?? part.tool_name ?? part.toolCallId;
+  return typeof name === "string" && name.length > 0 ? name : "tool";
+}
+
+/**
+ * One message as a compact ledger line: assistant text plus a marker for each
+ * tool call and each tool result. Tool activity is what makes routing decidable
+ * — without it the model sees the goal but never what just happened.
+ */
+function ledgerOf(message: unknown): LedgerEntry | null {
+  if (typeof message !== "object" || message === null) return null;
+  const record = message as Record<string, unknown>;
+  const type = record.type;
+  if (type !== undefined && type !== "message") return null;
+  const role = record.role;
+  if (role !== "user" && role !== "assistant" && role !== "tool") return null;
+
+  const pieces: string[] = [];
+  const content = record.content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      const kind = partKind(part);
+      const partRecord = (typeof part === "object" && part !== null ? part : {}) as Record<string, unknown>;
+      if (kind === "text") {
+        const text = textOf(part).slice(0, TURN_CHAR_BUDGET);
+        if (text) pieces.push(text);
+      } else if (kind === "tool-call") {
+        const input = summarizeValue(partRecord.input ?? partRecord.args ?? partRecord.arguments, 160);
+        pieces.push(`\u2192 ${toolNameOfPart(partRecord)}(${input})`);
+      } else if (kind === "tool-result") {
+        const out = summarizeValue(partRecord.output ?? partRecord.result, TOOL_RESULT_CHARS);
+        pieces.push(`\u2190 ${toolNameOfPart(partRecord)}${out ? `: ${out}` : ""}`);
+      } else if (kind === "tool-error") {
+        const err = summarizeValue(partRecord.error ?? partRecord.output, TOOL_RESULT_CHARS);
+        pieces.push(`\u2190 ${toolNameOfPart(partRecord)} ERROR${err ? `: ${err}` : ""}`);
+      } else if (
+        kind === "reasoning" ||
+        kind === "step-start" ||
+        kind === "step-finish" ||
+        kind === "snapshot"
+      ) {
+        continue;
+      } else {
+        const fallback = textOf(part).slice(0, TURN_CHAR_BUDGET);
+        if (fallback) pieces.push(fallback);
+      }
+    }
+  } else {
+    const text = textOf(content).slice(0, TURN_CHAR_BUDGET);
+    if (text) pieces.push(text);
+  }
+
+  // Legacy OpenAI shape: tool calls ride on the assistant message itself.
+  if (Array.isArray(record.tool_calls)) {
+    for (const call of record.tool_calls as unknown[]) {
+      const callRecord = (typeof call === "object" && call !== null ? call : {}) as Record<string, unknown>;
+      const fn = (typeof callRecord.function === "object" && callRecord.function !== null
+        ? callRecord.function
+        : callRecord) as Record<string, unknown>;
+      const name = typeof fn.name === "string" && fn.name ? fn.name : "tool";
+      const input = summarizeValue(fn.arguments ?? callRecord.input, 160);
+      pieces.push(`\u2192 ${name}(${input})`);
+    }
+  }
+
+  const joined = pieces.join(" ").replace(/\s+/g, " ").trim();
+  if (!joined) return null;
+  return { role: String(role), text: joined.slice(0, TURN_CHAR_BUDGET + TOOL_RESULT_CHARS) };
+}
+
 function stateOf(payload: Record<string, unknown>): string {
   // Anthropic/OpenAI chat carry `messages`; the Responses API carries `input`
   // items of type "message".
@@ -319,20 +446,8 @@ function stateOf(payload: Record<string, unknown>): string {
       ? payload.input
       : [];
   const turns = conversation
-    .filter(
-      (m): m is { role: string; content: unknown } =>
-        typeof m === "object" &&
-        m !== null &&
-        ((m as { type?: unknown }).type === undefined ||
-          (m as { type?: unknown }).type === "message") &&
-        ((m as { role?: unknown }).role === "user" ||
-          (m as { role?: unknown }).role === "assistant"),
-    )
-    .map((m) => ({
-      role: m.role,
-      text: textOf(m.content).slice(0, TURN_CHAR_BUDGET),
-    }))
-    .filter((turn) => turn.text.length > 0);
+    .map(ledgerOf)
+    .filter((turn): turn is LedgerEntry => turn !== null);
   const recent = turns.slice(-RECENT_TURNS);
   const firstUser = turns.find((turn) => turn.role === "user");
   const picked =
@@ -340,12 +455,11 @@ function stateOf(payload: Record<string, unknown>): string {
   return JSON.stringify(picked).slice(0, STATE_CHAR_BUDGET);
 }
 
-/* ------------------------------------------------------------ Jev client */
-
 async function askJev(
   cfg: JevConfig,
   state: string,
   names: string[],
+  descriptions: Record<string, string> = {},
 ): Promise<JevAnswer | undefined> {
   if (names.length > MAX_CRITERIA - 1)
     log(
@@ -355,7 +469,7 @@ async function askJev(
     respond_to_user: "Task is complete, or clarification from user is required",
   };
   for (const name of names.slice(0, MAX_CRITERIA - 1))
-    criteria[name] = `Use tool ${name}`;
+    criteria[name] = descriptions[name] ?? `Use tool ${name}`;
 
   const response = await nativeFetch(cfg.apiUrl, {
     method: "POST",
@@ -426,7 +540,7 @@ async function routePayload(
   // must still end in the tagged "bypass:" line — log contract §5.
   let answer: JevAnswer | undefined;
   try {
-    answer = await askJev(cfg, stateOf(payload), names);
+    answer = await askJev(cfg, stateOf(payload), names, toolDescriptions(payload.tools as unknown[]));
   } catch (error) {
     log(`jev round-trip threw: ${error}`);
   }
